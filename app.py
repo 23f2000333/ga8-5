@@ -111,6 +111,8 @@ def valid_string_list(v, allow_empty=False):
         return False
     if not allow_empty and len(v) == 0:
         return False
+    if len(v) == 0:
+        return True
     if not all(nonempty_string(x) for x in v):
         return False
     return len(v) == len(set(v))
@@ -183,7 +185,12 @@ def freeze_shape_valid(p):
     if not nonempty_string(p["tokenizerDigest"]):
         return False
 
-    if not valid_string_list(p["allowedUnsupportedReasons"]):
+    # The list itself may be empty; when entries exist, each must be a
+    # non-empty unique string.
+    if not valid_string_list(
+        p["allowedUnsupportedReasons"],
+        allow_empty=True,
+    ):
         return False
 
     candidates = p["candidates"]
