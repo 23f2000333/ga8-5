@@ -125,7 +125,7 @@ def freeze_request_valid(payload):
         "candidates",
     }
 
-    if set(payload.keys()) != required:
+    if not required.issubset(payload.keys()):
         return False
 
     if payload["phase"] != "freeze":
@@ -166,7 +166,7 @@ def freeze_request_valid(payload):
             "unsupportedReason",
         }
 
-        if set(c.keys()) != required_candidate:
+        if not required_candidate.issubset(c.keys()):
             return False
 
         if not nonempty_string(c["name"]):
@@ -183,8 +183,10 @@ def freeze_request_valid(payload):
         if not nonempty_string(c["tokenizerDigest"]):
             return False
 
-        if c["unsupportedReason"] is not None and not nonempty_string(
-            c["unsupportedReason"]
+        if (
+            "unsupportedReason" in c
+            and c["unsupportedReason"] is not None
+            and not nonempty_string(c["unsupportedReason"])
         ):
             return False
 
@@ -224,7 +226,7 @@ def build_freeze(payload):
         inventory, total_bytes, package_digest = inv
         reasons = []
 
-        unsupported = candidate["unsupportedReason"]
+        unsupported = candidate.get("unsupportedReason")
 
         if unsupported is not None:
             if unsupported not in allowed:
@@ -294,7 +296,7 @@ def select_request_valid(payload):
         "rows",
     }
 
-    if set(payload.keys()) != required:
+    if not required.issubset(payload.keys()):
         return False
 
     if payload["phase"] != "select":
