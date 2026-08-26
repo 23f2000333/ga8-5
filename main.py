@@ -188,6 +188,12 @@ def build_inventory(files):
 # ============================================================
 
 def validate_freeze_request(body):
+    """
+    Only reject the explicitly invalid FREEZE request shape.
+
+    Candidate-level problems are handled by freeze_one_candidate().
+    """
+
     if not isinstance(body, dict):
         return False
 
@@ -196,56 +202,72 @@ def validate_freeze_request(body):
 
     freeze_id = body.get("freezeId")
 
+    if not isinstance(freeze_id, str):
+        return False
+
+    if not freeze_id:
+        return False
+
+    if len(freeze_id) > 128:
+        return False
+
+    calibration = body.get(
+        "calibrationDigest"
+    )
+
+    tokenizer = body.get(
+        "tokenizerDigest"
+    )
+
     if (
-        not nonempty_string(freeze_id)
-        or len(freeze_id) > 128
+        not isinstance(calibration, str)
+        or not calibration
     ):
         return False
 
-    if not nonempty_string(
-        body.get("calibrationDigest")
+    if (
+        not isinstance(tokenizer, str)
+        or not tokenizer
     ):
         return False
 
-    if not nonempty_string(
-        body.get("tokenizerDigest")
-    ):
+    reasons = body.get(
+        "allowedUnsupportedReasons"
+    )
+
+    if not isinstance(reasons, list):
         return False
 
-    if not unique_nonempty_strings(
-        body.get(
-            "allowedUnsupportedReasons"
-        )
-    ):
-        return False
+    seen_reasons = set()
 
-    candidates = body.get("candidates")
+    for reason in reasons:
 
+        if (
+            not isinstance(reason, str)
+            or not reason
+        ):
+            return False
+
+        if reason in seen_reasons:
+            return False
+
+        seen_reasons.add(reason)
+
+    candidates = body.get(
+        "candidates"
+    )
+
+    # Explicitly required to be a non-empty array.
     if (
         not isinstance(candidates, list)
         or len(candidates) == 0
     ):
         return False
 
-    names = []
-
-    for candidate in candidates:
-
-        if not isinstance(candidate, dict):
-            return False
-
-        name = candidate.get("name")
-
-        if not nonempty_string(name):
-            return False
-
-        names.append(name)
-
-    if len(names) != len(set(names)):
-        return False
+    # Do NOT reject candidate contents here.
+    # freeze_one_candidate() handles them.
 
     return True
-
 
 # ============================================================
 # FREEZE CANDIDATE
@@ -257,19 +279,46 @@ def freeze_one_candidate(
     request_tokenizer,
     allowed_reasons,
 ):
-    name = candidate["name"]
+    """
+    Candidate-level validation.
+
+    Never raises an exception.
+    """
+
+    # --------------------------------------------------------
+    # Candidate must be an object.
+    # --------------------------------------------------------
+
+    if not isinstance(candidate, dict):
+
+        return {
+            "name": "",
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [],
+        }
+
+    name = candidate.get("name")
+
+    # A candidate name is required.
+    if not isinstance(name, str):
+        name = ""
+
+    # --------------------------------------------------------
+    # Files
+    # --------------------------------------------------------
 
     files = candidate.get("files")
 
-    files_valid, inventory, total_bytes, package_digest = (
+    valid_files, inventory, total_bytes, package_digest = (
         build_inventory(files)
     )
 
-    # --------------------------------------------------------
-    # Invalid files
-    # --------------------------------------------------------
+    # Invalid files have the explicitly required empty result.
+    if not valid_files:
 
-    if not files_valid:
         return {
             "name": name,
             "status": "invalid",
@@ -281,13 +330,13 @@ def freeze_one_candidate(
 
     codes = set()
 
+    # --------------------------------------------------------
+    # Unsupported reason
+    # --------------------------------------------------------
+
     unsupported_reason = candidate.get(
         "unsupportedReason"
     )
-
-    # --------------------------------------------------------
-    # Unsupported candidate
-    # --------------------------------------------------------
 
     if (
         isinstance(unsupported_reason, str)
@@ -319,7 +368,9 @@ def freeze_one_candidate(
         }
 
     # --------------------------------------------------------
-    # Normal candidate
+    # No unsupported reason.
+    #
+    # Must be loadable and match both digests.
     # --------------------------------------------------------
 
     if candidate.get("loadable") is not True:
@@ -346,6 +397,10 @@ def freeze_one_candidate(
             "reasonCodes": sorted_codes(codes),
         }
 
+    # --------------------------------------------------------
+    # Valid candidate.
+    # --------------------------------------------------------
+
     return {
         "name": name,
         "status": "frozen",
@@ -355,13 +410,11 @@ def freeze_one_candidate(
         "reasonCodes": [],
     }
 
-
 # ============================================================
 # FREEZE
 # ============================================================
 
 def handle_freeze(body):
-
     freeze_id = body["freezeId"]
 
     # --------------------------------------------------------
@@ -374,11 +427,8 @@ def handle_freeze(body):
 
         previous = FREEZES[freeze_id]
 
-        if (
-            previous["request"]
-            == request_signature
-        ):
-
+        # Exact replay -> return the persisted response unchanged.
+        if previous["request"] == request_signature:
             return (
                 200,
                 copy.deepcopy(
@@ -386,16 +436,43 @@ def handle_freeze(body):
                 ),
             )
 
+        # Same freezeId with different input.
         return (
             409,
             {
-                "error":
-                    "FREEZE_ID_CONFLICT"
+                "error": "FREEZE_ID_CONFLICT"
             },
         )
 
     # --------------------------------------------------------
-    # Build response
+    # Candidate names
+    #
+    # Candidate-level malformed data is handled by
+    # freeze_one_candidate(), not converted into HTTP 400 here.
+    # --------------------------------------------------------
+
+    names = []
+
+    for candidate in body["candidates"]:
+
+        if isinstance(candidate, dict):
+
+            name = candidate.get("name")
+
+            if isinstance(name, str) and name:
+                names.append(name)
+
+    # Valid candidate names must be unique.
+    if len(names) != len(set(names)):
+        return (
+            400,
+            {
+                "error": "INVALID_INPUT"
+            },
+        )
+
+    # --------------------------------------------------------
+    # Build candidates
     # --------------------------------------------------------
 
     allowed = set(
@@ -415,10 +492,14 @@ def handle_freeze(body):
 
         candidates.append(result)
 
-    # Required ordering: UTF-8 candidate name.
+    # --------------------------------------------------------
+    # Required ordering:
+    # UTF-8 candidate name.
+    # --------------------------------------------------------
+
     candidates.sort(
         key=lambda item:
-            item["name"].encode("utf-8")
+            item.get("name", "").encode("utf-8")
     )
 
     response = {
@@ -427,7 +508,10 @@ def handle_freeze(body):
     }
 
     # --------------------------------------------------------
-    # Persist complete response.
+    # Persist complete freeze state.
+    #
+    # This happens only after the entire freeze request has
+    # successfully been processed.
     # --------------------------------------------------------
 
     FREEZES[freeze_id] = {
@@ -437,8 +521,10 @@ def handle_freeze(body):
         ),
     }
 
-    return 200, response
-
+    return (
+        200,
+        response,
+    )
 
 # ============================================================
 # SELECT REQUEST VALIDATION
