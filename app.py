@@ -113,6 +113,10 @@ def inventory_for(name, files):
 
 
 def freeze_request_valid(payload):
+    # Only the explicitly listed malformed freeze-request conditions are HTTP
+    # 400: bad/missing phase, invalid freezeId, invalid top-level digests/list,
+    # empty/non-array candidates. Candidate/file defects are represented in
+    # the frozen candidate result instead.
     if not isinstance(payload, dict):
         return False
 
@@ -151,55 +155,20 @@ def freeze_request_valid(payload):
     if not isinstance(candidates, list) or not candidates:
         return False
 
+    # Candidate structure and file contents are deliberately NOT rejected at
+    # the HTTP layer. The specification requires invalid candidate files to
+    # produce an "invalid" candidate with empty/null inventory fields.
+    # Names are checked here only when present so duplicate valid names can
+    # still be detected deterministically.
     names = []
-
     for c in candidates:
-        if not isinstance(c, dict):
-            return False
+        if isinstance(c, dict) and isinstance(c.get("name"), str):
+            if c["name"]:
+                names.append(c["name"])
 
-        required_candidate = {
-            "name",
-            "files",
-            "loadable",
-            "calibrationDigest",
-            "tokenizerDigest",
-            "unsupportedReason",
-        }
-
-        if not required_candidate.issubset(c.keys()):
-            return False
-
-        if not nonempty_string(c["name"]):
-            return False
-
-        names.append(c["name"])
-
-        if not isinstance(c["loadable"], bool):
-            return False
-
-        if not nonempty_string(c["calibrationDigest"]):
-            return False
-
-        if not nonempty_string(c["tokenizerDigest"]):
-            return False
-
-        if (
-            "unsupportedReason" in c
-            and c["unsupportedReason"] is not None
-            and not nonempty_string(c["unsupportedReason"])
-        ):
-            return False
-
-        if not isinstance(c["files"], dict) or not c["files"]:
-            return False
-
-        for filename, content in c["files"].items():
-            if not nonempty_string(filename):
-                return False
-            if not isinstance(content, str):
-                return False
-
-    return len(names) == len(set(names))
+    # Duplicate/empty candidate names are candidate-level invalid data.
+    # They must not cause a rejected freeze request to reserve freezeId.
+    return True
 
 
 def build_freeze(payload):
@@ -208,9 +177,33 @@ def build_freeze(payload):
     allowed = set(payload["allowedUnsupportedReasons"])
 
     for candidate in payload["candidates"]:
-        name = candidate["name"]
+        # A malformed candidate cannot safely contribute a name or metadata.
+        # Preserve the required response shape as far as possible.
+        if not isinstance(candidate, dict):
+            result.append({
+                "name": "",
+                "status": "invalid",
+                "inventory": [],
+                "totalBytes": None,
+                "packageDigest": None,
+                "reasonCodes": ["INVALID_INPUT"],
+            })
+            continue
 
-        inv = inventory_for(name, candidate["files"])
+        name = candidate.get("name")
+        if not nonempty_string(name):
+            result.append({
+                "name": name if isinstance(name, str) else "",
+                "status": "invalid",
+                "inventory": [],
+                "totalBytes": None,
+                "packageDigest": None,
+                "reasonCodes": ["INVALID_INPUT"],
+            })
+            continue
+
+        # Files are the important candidate-level validity boundary.
+        inv = inventory_for(name, candidate.get("files"))
 
         if inv is None:
             result.append({
@@ -226,49 +219,61 @@ def build_freeze(payload):
         inventory, total_bytes, package_digest = inv
         reasons = []
 
+        loadable = candidate.get("loadable")
+        candidate_cal = candidate.get("calibrationDigest")
+        candidate_tok = candidate.get("tokenizerDigest")
         unsupported = candidate.get("unsupportedReason")
 
-        if unsupported is not None:
-            if unsupported not in allowed:
-                reasons.append("UNALLOWED_UNSUPPORTED_REASON")
-            else:
-                status = "unsupported"
+        # Malformed candidate metadata is candidate-level invalid input.
+        if not isinstance(loadable, bool):
+            reasons.append("INVALID_INPUT")
 
-                # An allowed unsupported reason is sufficient to classify it
-                # unsupported. Other integrity failures still make it invalid.
-                if candidate["calibrationDigest"] != payload["calibrationDigest"]:
-                    reasons.append("CALIBRATION_MISMATCH")
+        if not nonempty_string(candidate_cal):
+            reasons.append("INVALID_INPUT")
 
-                if candidate["tokenizerDigest"] != payload["tokenizerDigest"]:
-                    reasons.append("TOKENIZER_MISMATCH")
+        if not nonempty_string(candidate_tok):
+            reasons.append("INVALID_INPUT")
 
-                if reasons:
-                    status = "invalid"
+        if unsupported is not None and not nonempty_string(unsupported):
+            reasons.append("INVALID_INPUT")
 
-                result.append({
-                    "name": name,
-                    "status": status,
-                    "inventory": inventory,
-                    "totalBytes": total_bytes,
-                    "packageDigest": package_digest,
-                    "reasonCodes": codes_sorted(reasons),
-                })
-                continue
+        if "INVALID_INPUT" not in reasons:
+            if unsupported is not None:
+                if unsupported not in allowed:
+                    reasons.append("UNALLOWED_UNSUPPORTED_REASON")
+                else:
+                    # Allowed unsupported candidates are unsupported unless
+                    # another independent integrity condition makes them
+                    # invalid.
+                    if candidate_cal != payload["calibrationDigest"]:
+                        reasons.append("CALIBRATION_MISMATCH")
+                    if candidate_tok != payload["tokenizerDigest"]:
+                        reasons.append("TOKENIZER_MISMATCH")
 
-        if not candidate["loadable"]:
-            reasons.append("NOT_LOADABLE")
+                    status = "unsupported" if not reasons else "invalid"
 
-        if candidate["calibrationDigest"] != payload["calibrationDigest"]:
-            reasons.append("CALIBRATION_MISMATCH")
+                    result.append({
+                        "name": name,
+                        "status": status,
+                        "inventory": inventory,
+                        "totalBytes": total_bytes,
+                        "packageDigest": package_digest,
+                        "reasonCodes": codes_sorted(reasons),
+                    })
+                    continue
 
-        if candidate["tokenizerDigest"] != payload["tokenizerDigest"]:
-            reasons.append("TOKENIZER_MISMATCH")
+            if loadable is False:
+                reasons.append("NOT_LOADABLE")
 
-        status = "frozen" if not reasons else "invalid"
+            if candidate_cal != payload["calibrationDigest"]:
+                reasons.append("CALIBRATION_MISMATCH")
+
+            if candidate_tok != payload["tokenizerDigest"]:
+                reasons.append("TOKENIZER_MISMATCH")
 
         result.append({
             "name": name,
-            "status": status,
+            "status": "frozen" if not reasons else "invalid",
             "inventory": inventory,
             "totalBytes": total_bytes,
             "packageDigest": package_digest,
